@@ -1,0 +1,252 @@
+Parameters:
+  Tag:
+    Type: String
+    Default: dev
+  LambdaName:
+    Type: String
+    Default: app
+  ConnTableName:
+    Type: String
+    Default: connections
+  MessTableName:
+    Type: String
+    Default: messages
+
+Resources: 
+
+######################################################
+# Cloud Watch Logs                                   #
+######################################################
+
+  AppLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LambdaName}"
+
+######################################################
+# Poles and Policies                                 #
+######################################################
+
+  IamRoleLambdaExecution:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${LambdaName}-role"  
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service:
+            - "lambda.amazonaws.com"
+          Action: "sts:AssumeRole"
+      ManagedPolicyArns: 
+      - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+      - PolicyName: !Sub "${LambdaName}-dynamodb-policy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+            - "dynamodb:*"
+            Resource:
+            - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*"
+      - PolicyName: !Sub "${LambdaName}-apigw-policy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+            - "execute-api:ManageConnections"
+            Resource:
+            - !Sub "arn:aws:execute-api:*:*:*/*"
+      
+  ApiGatewayCloudWatchRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+
+######################################################
+# API GW                                             #
+######################################################
+
+  ApiGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${LambdaName}-ApiGateway"
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+      ApiKeySelectionExpression: $request.header.x-api-key
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: ConnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref ConnectIntegration
+
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      Description: Connect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambda.Arn}/invocations"
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: DisconnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref ConnectIntegration
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      Description: Disconnect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambda.Arn}/invocations"
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: $default
+      AuthorizationType: NONE
+      OperationName: DefaultRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref DefaultIntegration
+
+  DefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      Description: Default Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambda.Arn}/invocations"
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: dev
+      Description: Development Stage
+      DeploymentId: !Ref Deployment
+      ApiId: !Ref ApiGateway
+      DefaultRouteSettings:
+        DetailedMetricsEnabled: true
+        LoggingLevel: INFO
+
+  Deployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+    - ConnectRoute
+    - DisconnectRoute
+    - DefaultRoute
+    Properties:
+      ApiId: !Ref ApiGateway
+
+  ApiGatewayAccountConfig:
+    Type: "AWS::ApiGateway::Account"
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+######################################################
+# Dynamo DB                                          #
+######################################################
+
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref ConnTableName
+      AttributeDefinitions:
+      - AttributeName: "connectionId"
+        AttributeType: "S"
+      KeySchema:
+      - AttributeName: "connectionId"
+        KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref MessTableName
+      AttributeDefinitions:
+      - AttributeName: "messageId"
+        AttributeType: "S"
+      KeySchema:
+      - AttributeName: "messageId"
+        KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      
+######################################################
+# Lambda                                             #
+######################################################
+
+  MyLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          import logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG)
+          def handler(event, context):
+            logger.debug(event)
+            return {
+                "statusCode": 200
+            }
+      Description: "My Lambda"
+      FunctionName: !Ref "LambdaName"
+      Handler: "index.handler"
+      MemorySize: 256
+      PackageType: "Zip"
+      Role: !GetAtt "IamRoleLambdaExecution.Arn"
+      Runtime: "python3.9"
+      Timeout: 30
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - ApiGateway
+      - MyLambda
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref "LambdaName"
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*"
+
+######################################################
+# Outputs                                            #
+######################################################
+
+Outputs:
+
+  ApiGatewayURI:
+    Description: "The WSS Protocol URI to connect to"
+    Value: !Sub "wss://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
